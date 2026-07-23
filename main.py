@@ -11,6 +11,8 @@ from app.bigram_model import BigramModel
 from app.embedding_model import get_word_embedding
 from app.cnn_model import CNNClassifier
 from app.gan_model import Generator
+from app.diffusion_model import SimpleUNet
+from app.energy_model import EnergyModel, langevin_sample
 
 
 app = FastAPI()
@@ -45,6 +47,14 @@ class EmbeddingRequest(BaseModel):
 # ==================================================
 
 device = torch.device("cpu")
+
+generation_device = torch.device(
+    "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
+
+print("Image generation device:", generation_device)
 
 
 # ==================================================
@@ -109,6 +119,273 @@ gan_generator.load_state_dict(
 )
 
 gan_generator.eval()
+
+
+# ==================================================
+# Diffusion Image Generator
+# ==================================================
+
+diffusion_model = SimpleUNet().to(
+    generation_device
+)
+
+diffusion_model_path = (
+    Path(__file__).parent
+    / "app"
+    / "diffusion_weights.pth"
+)
+
+diffusion_model.load_state_dict(
+    torch.load(
+        diffusion_model_path,
+        map_location=generation_device,
+        weights_only=True
+    )
+)
+
+diffusion_model.eval()
+
+
+DIFFUSION_TIMESTEPS = 1000
+
+diffusion_betas = torch.linspace(
+    1e-4,
+    0.02,
+    DIFFUSION_TIMESTEPS,
+    device=generation_device
+)
+
+diffusion_alphas = 1.0 - diffusion_betas
+
+diffusion_alphas_cumprod = torch.cumprod(
+    diffusion_alphas,
+    dim=0
+)
+
+diffusion_alphas_cumprod_previous = torch.cat([
+    torch.ones(
+        1,
+        device=generation_device
+    ),
+    diffusion_alphas_cumprod[:-1]
+])
+
+diffusion_sqrt_reciprocal_alphas = torch.sqrt(
+    1.0 / diffusion_alphas
+)
+
+diffusion_sqrt_one_minus_alphas_cumprod = torch.sqrt(
+    1.0 - diffusion_alphas_cumprod
+)
+
+diffusion_posterior_variance = (
+    diffusion_betas
+    * (
+        1.0
+        - diffusion_alphas_cumprod_previous
+    )
+    / (
+        1.0
+        - diffusion_alphas_cumprod
+    )
+)
+
+
+def extract_diffusion_value(
+    values,
+    timesteps,
+    image_shape
+):
+    batch_size = timesteps.shape[0]
+
+    selected_values = values.gather(
+        0,
+        timesteps
+    )
+
+    return selected_values.reshape(
+        batch_size,
+        *((1,) * (len(image_shape) - 1))
+    )
+
+
+@torch.inference_mode()
+def sample_diffusion_image():
+
+    image = torch.randn(
+        1,
+        3,
+        32,
+        32,
+        device=generation_device
+    )
+
+    for step in reversed(
+        range(DIFFUSION_TIMESTEPS)
+    ):
+
+        timestep = torch.full(
+            (1,),
+            step,
+            device=generation_device,
+            dtype=torch.long
+        )
+
+        beta_t = extract_diffusion_value(
+            diffusion_betas,
+            timestep,
+            image.shape
+        )
+
+        sqrt_reciprocal_alpha_t = (
+            extract_diffusion_value(
+                diffusion_sqrt_reciprocal_alphas,
+                timestep,
+                image.shape
+            )
+        )
+
+        sqrt_one_minus_cumprod_t = (
+            extract_diffusion_value(
+                diffusion_sqrt_one_minus_alphas_cumprod,
+                timestep,
+                image.shape
+            )
+        )
+
+        predicted_noise = diffusion_model(
+            image,
+            timestep
+        )
+
+        model_mean = (
+            sqrt_reciprocal_alpha_t
+            * (
+                image
+                - beta_t
+                * predicted_noise
+                / sqrt_one_minus_cumprod_t
+            )
+        )
+
+        if step > 0:
+
+            posterior_variance_t = (
+                extract_diffusion_value(
+                    diffusion_posterior_variance,
+                    timestep,
+                    image.shape
+                )
+            )
+
+            random_noise = torch.randn_like(
+                image
+            )
+
+            image = (
+                model_mean
+                + torch.sqrt(
+                    posterior_variance_t
+                )
+                * random_noise
+            )
+
+        else:
+            image = model_mean
+
+    image = image.clamp(-1.0, 1.0)
+
+    return (image + 1.0) / 2.0
+
+
+# ==================================================
+# Energy-Based Image Generator
+# ==================================================
+
+energy_model = EnergyModel().to(
+    generation_device
+)
+
+energy_model_path = (
+    Path(__file__).parent
+    / "app"
+    / "energy_weights.pth"
+)
+
+energy_model.load_state_dict(
+    torch.load(
+        energy_model_path,
+        map_location=generation_device,
+        weights_only=True
+    )
+)
+
+energy_model.eval()
+
+# During Langevin sampling, gradients are calculated
+# with respect to the image, not model parameters.
+for parameter in energy_model.parameters():
+    parameter.requires_grad_(False)
+
+
+def sample_energy_image():
+
+    initial_image = torch.empty(
+        1,
+        3,
+        32,
+        32,
+        device=generation_device
+    ).uniform_(-1.0, 1.0)
+
+    generated_image = langevin_sample(
+        model=energy_model,
+        images=initial_image,
+        steps=100,
+        step_size=0.1,
+        noise_scale=0.005
+    )
+
+    generated_image = (
+        generated_image
+        .detach()
+        .clamp(-1.0, 1.0)
+    )
+
+    return (generated_image + 1.0) / 2.0
+
+
+def tensor_to_png_response(
+    image_tensor,
+    filename
+):
+
+    image_tensor = (
+        image_tensor
+        .squeeze(0)
+        .detach()
+        .cpu()
+    )
+
+    image = transforms.ToPILImage()(
+        image_tensor
+    )
+
+    image_buffer = io.BytesIO()
+
+    image.save(
+        image_buffer,
+        format="PNG"
+    )
+
+    return Response(
+        content=image_buffer.getvalue(),
+        media_type="image/png",
+        headers={
+            "Content-Disposition":
+            f'inline; filename="{filename}"'
+        }
+    )
 
 
 # ==================================================
@@ -252,3 +529,32 @@ def generate_digit():
             'inline; filename="generated_digit.png"'
         }
     )
+
+
+@app.get(
+    "/generate-diffusion-image",
+    response_class=Response
+)
+def generate_diffusion_image():
+
+    generated_image = sample_diffusion_image()
+
+    return tensor_to_png_response(
+        generated_image,
+        "diffusion_image.png"
+    )
+
+
+@app.get(
+    "/generate-energy-image",
+    response_class=Response
+)
+def generate_energy_image():
+
+    generated_image = sample_energy_image()
+
+    return tensor_to_png_response(
+        generated_image,
+        "energy_image.png"
+    )
+
